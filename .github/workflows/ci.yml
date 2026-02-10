@@ -1,50 +1,53 @@
-name: CI
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.19'
-
-    - name: Build
-      run: go build -o dummy-server.bin ./cmd
-
     - name: Test
       run: |
+        echo "=== 1. ЗАПУСК СЕРВЕРА ==="
         ./dummy-server.bin &
         SERVER_PID=$!
-        echo "Сервер запущен (PID: $SERVER_PID)"
-        sleep 10
-        if ! kill -0 $SERVER_PID 2>/dev/null; then
-          echo "Ошибка: Процесс сервера завершился."
-          exit 1
-        fi
-        echo "Тестируем подключение..."
-        if RESPONSE=$(curl -s -f --connect-timeout 10 http://localhost:8888 2>/dev/null); then
-          echo "Успех: Сервер ответил: '$RESPONSE'"
-          kill $SERVER_PID
-          wait $SERVER_PID 2>/dev/null
-          exit 0
+        echo "PID сервера: $SERVER_PID"
+
+        echo "=== 2. ПРОВЕРКА ПРОЦЕССА (через 2 сек) ==="
+        sleep 2
+        if ps -p $SERVER_PID > /dev/null; then
+          echo "✅ Процесс сервера жив."
         else
-          echo "Ошибка: Не удалось получить ответ от сервера."
-          kill -9 $SERVER_PID 2>/dev/null
+          echo "❌ Процесс сервера завершился. Проверьте логи выше на наличие ошибок."
           exit 1
         fi
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: dummy-server-binary
-        path: ./dummy-server.bin
-        retention-days: 7
+        echo "=== 3. ПРОВЕРКА ПОРТА ==="
+        echo "Список процессов, слушающих порты (ищем 8888):"
+        ss -tulpn | grep : || true
+        if ss -tulpn | grep :8888 > /dev/null; then
+          echo "✅ Порт 8888 занят процессом."
+        else
+          echo "⚠️  Порт 8888 не слушается. Пробуем netstat..."
+          netstat -tulpn 2>/dev/null | grep :8888 || echo "netstat не подтвердил."
+        fi
+
+        echo "=== 4. ТЕСТИРОВАНИЕ ПОДКЛЮЧЕНИЯ (3 попытки) ==="
+        for i in {1..3}; do
+          echo "--- Попытка $i ---"
+          # Пробуем получить ответ с коротким таймаутом
+          if RESPONSE=$(timeout 5 curl -s -f http://localhost:8888 2>&1); then
+            echo "✅ Успех! Ответ сервера: '$RESPONSE'"
+            echo "=== 5. ЗАВЕРШЕНИЕ ==="
+            kill $SERVER_PID
+            wait $SERVER_PID 2>/dev/null
+            echo "Сервер остановлен. Тест пройден."
+            exit 0
+          else
+            CURL_EXIT_CODE=$?
+            echo "curl завершился с кодом $CURL_EXIT_CODE"
+            echo "Вывод curl (если был): $RESPONSE"
+            echo "Ждём 3 секунды перед повторной попыткой..."
+            sleep 3
+          fi
+        done
+
+        echo "=== 5. ФИНАЛЬНАЯ ДИАГНОСТИКА (перед падением) ==="
+        echo "Проверяем, жив ли ещё процесс сервера:"
+        ps -p $SERVER_PID > /dev/null && echo "Жив. Принудительно завершаем." || echo "Уже завершился."
+        kill -9 $SERVER_PID 2>/dev/null || true
+
+        echo "❌ Все попытки подключиться не удались."
+        exit 1
